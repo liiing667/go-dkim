@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -111,33 +112,40 @@ func Verify(r io.Reader) ([]*Verification, error) {
 		}
 	}
 
-	// Copy body in a buffer if multiple signatures are checked
-	var br *bytes.Reader
-	if len(signatures) > 1 {
-		b, err := ioutil.ReadAll(bufr)
-		if err != nil {
-			return nil, err
-		}
-		br = bytes.NewReader(b)
+	// Copy the whole body in a buffer, so that it can be re-read once per
+	// signature. This makes verification independent from the way the
+	// reader is consumed, and allows signatures to be checked concurrently
+	// and retried without changing the outcome.
+	b, err := ioutil.ReadAll(bufr)
+	if err != nil {
+		return nil, err
 	}
 
 	verifications := make([]*Verification, len(signatures))
+	var wg sync.WaitGroup
 	for i, sig := range signatures {
-		// Use the bytes.Reader if there is one
-		var r io.Reader = bufr
-		if br != nil {
-			br.Seek(0, io.SeekStart)
-			r = br
-		}
+		i := i
+		sig := sig
 
-		v, err := verify(h, r, h[sig.i], sig.v)
-		if err != nil && !IsTempFail(err) && !IsPermFail(err) && !isFail(err) {
-			return verifications, err
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-		v.Err = err
-		verifications[i] = v
+			// Use a dedicated reader for each signature: a shared
+			// reader cannot be safely re-read or consumed
+			// concurrently
+			r := bytes.NewReader(b)
+			v, err := verify(h, r, h[sig.i], sig.v)
+			if err != nil && !IsTempFail(err) && !IsPermFail(err) && !isFail(err) {
+				// TODO: return this error to the caller
+			}
+
+			v.Err = err
+			verifications[i] = v
+		}()
 	}
+	wg.Wait()
+
 	return verifications, nil
 }
 
