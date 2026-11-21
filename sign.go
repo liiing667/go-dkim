@@ -7,16 +7,23 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ed25519"
 )
 
 var randReader io.Reader = rand.Reader
+
+// ErrSignerCanceled is returned when a signer is closed before the message
+// has been completely written. No signature is produced for a canceled
+// message.
+var ErrSignerCanceled = errors.New("dkim: signing canceled")
 
 // SignOptions is used to configure Sign. Domain, Selector and Signer are
 // mandatory.
@@ -79,10 +86,20 @@ type SignOptions struct {
 //
 // After a successful Close, Signature can be called to retrieve the
 // DKIM-Signature header field that the caller should prepend to the message.
+//
+// If the message is abandoned before it has been completely written, Cancel
+// (or CloseWithError) must be used instead of Close. It stops the signing
+// goroutine and guarantees that no signature is published for the partial
+// message.
 type Signer struct {
 	pw   *io.PipeWriter
 	done <-chan error
 	sig  string // only valid after done received nil
+
+	mu        sync.Mutex
+	canceled  bool
+	closeErr  error
+	closeOnce sync.Once
 }
 
 // NewSigner creates a new signer. It returns an error if SignOptions is
@@ -258,6 +275,10 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		}
 		hashed := hasher.Sum(nil)
 
+		if s.isCanceled() {
+			closeReadWithError(ErrSignerCanceled)
+			return
+		}
 		sig, err := options.Signer.Sign(randReader, hashed, hash)
 		if err != nil {
 			closeReadWithError(err)
@@ -265,7 +286,11 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		}
 		params["b"] = base64.StdEncoding.EncodeToString(sig)
 
-		s.sig = formatSignature(params)
+		finalSigField := formatSignature(params)
+		if !s.setSignature(finalSigField) {
+			closeReadWithError(ErrSignerCanceled)
+			return
+		}
 		closeReadWithError(nil)
 		close(done)
 	}()
@@ -278,12 +303,76 @@ func (s *Signer) Write(b []byte) (n int, err error) {
 	return s.pw.Write(b)
 }
 
+func (s *Signer) setSignature(sig string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.canceled {
+		return false
+	}
+	s.sig = sig
+	return true
+}
+
+func (s *Signer) isCanceled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.canceled
+}
+
 // Close implements io.WriteCloser. The error return by Close must be checked.
 func (s *Signer) Close() error {
-	if err := s.pw.Close(); err != nil {
-		return err
+	return s.close(nil)
+}
+
+// CloseWithError closes the signer and discards the signature. The supplied
+// error is reported to the reader of the message and no signature is
+// published. It is safe to call CloseWithError more than once.
+func (s *Signer) CloseWithError(err error) error {
+	if err == nil {
+		return s.Close()
 	}
-	return <-s.done
+	return s.close(err)
+}
+
+// Cancel aborts signing. After Cancel returns, Signature must not be called
+// and Close will return an error.
+func (s *Signer) Cancel() error {
+	return s.close(ErrSignerCanceled)
+}
+
+// Abort is an alias for Cancel.
+func (s *Signer) Abort() error {
+	return s.Cancel()
+}
+
+func (s *Signer) close(err error) error {
+	s.closeOnce.Do(func() {
+		var cancelErr error
+		if err != nil {
+			s.mu.Lock()
+			s.canceled = true
+			s.sig = ""
+			s.mu.Unlock()
+			cancelErr = err
+		}
+
+		// Closing the pipe (with an error when canceling) makes the signing
+		// goroutine stop waiting for more message data. Waiting for done
+		// guarantees that a canceled signer cannot publish a signature after
+		// the message has been abandoned.
+		if closeErr := s.pw.CloseWithError(err); closeErr != nil && cancelErr == nil {
+			s.closeErr = closeErr
+		} else {
+			doneErr := <-s.done
+			if cancelErr != nil {
+				s.closeErr = cancelErr
+			} else {
+				s.closeErr = doneErr
+			}
+		}
+	})
+	return s.closeErr
 }
 
 // Signature returns the whole DKIM-Signature header field. It can only be
@@ -292,6 +381,9 @@ func (s *Signer) Close() error {
 // The returned value contains both the header field name, its value and the
 // final CRLF.
 func (s *Signer) Signature() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.sig == "" {
 		panic("dkim: Signer.Signature must only be called after a succesful Signer.Close")
 	}
@@ -312,6 +404,7 @@ func Sign(w io.Writer, r io.Reader, options *SignOptions) error {
 	mw := io.MultiWriter(&b, s)
 
 	if _, err := io.Copy(mw, r); err != nil {
+		s.CloseWithError(err)
 		return err
 	}
 	if err := s.Close(); err != nil {
