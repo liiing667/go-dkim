@@ -15,6 +15,7 @@ import (
 	"net/textproto"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -78,8 +79,17 @@ func (f *stringSliceFlag) Set(value string) error {
 }
 
 type session struct {
+	// authResDelete contains the index (in the full message header block) of
+	// each Authentication-Results header field previously added by this
+	// milter that must be removed. Keeping absolute indices guarantees the
+	// same header field is targeted on a retry or after other header fields
+	// have been inserted.
 	authResDelete []int
 	headerBuf     bytes.Buffer
+	// headerNames records the name of each header field in the order it was
+	// received, so the position of a field can be resolved deterministically
+	// instead of relying on textproto.MIMEHeader's per-name grouping.
+	headerNames []string
 
 	signDomain     string
 	signHeaderKeys []string
@@ -122,6 +132,9 @@ func parseAddressDomain(s string) (string, error) {
 }
 
 func (s *session) Header(name string, value string, m *milter.Modifier) (milter.Response, error) {
+	// Record the absolute position of this header field before any mutation.
+	s.headerNames = append(s.headerNames, name)
+
 	if strings.EqualFold(name, "From") || strings.EqualFold(name, "Sender") {
 		domain, err := parseAddressDomain(value)
 		if err != nil {
@@ -136,6 +149,10 @@ func (s *session) Header(name string, value string, m *milter.Modifier) (milter.
 		}
 	}
 
+	// Append one "h=" entry per received header field, including repeated
+	// fields. The signer resolves each entry to a concrete header field from
+	// bottom to top, so repeated names stay bound to their original position
+	// and an injected duplicate cannot be substituted for a signed field.
 	for _, k := range signHeaderKeys {
 		if strings.EqualFold(name, k) {
 			s.signHeaderKeys = append(s.signHeaderKeys, name)
@@ -158,11 +175,29 @@ func (s *session) Headers(h textproto.MIMEHeader, m *milter.Modifier) (milter.Re
 		return nil, err
 	}
 
-	// Delete any existing Authentication-Results header field with our identity
+	// Delete any existing Authentication-Results header field with our
+	// identity. textproto.MIMEHeader groups same-named fields and only exposes
+	// per-name indices, whereas milter.ChangeHeader expects the field's index
+	// in the whole header block: resolve absolute indices from the recorded
+	// field names to always target the exact same header field.
 	fields := h["Authentication-Results"]
 	for i, field := range fields {
 		if strings.EqualFold(identity, getIdentity(field)) {
-			s.authResDelete = append(s.authResDelete, i)
+			fieldIndex := -1
+			occurrence := i
+			for j, name := range s.headerNames {
+				if !strings.EqualFold(name, "Authentication-Results") {
+					continue
+				}
+				if occurrence == 0 {
+					fieldIndex = j
+					break
+				}
+				occurrence--
+			}
+			if fieldIndex >= 0 {
+				s.authResDelete = append(s.authResDelete, fieldIndex)
+			}
 		}
 	}
 
@@ -221,7 +256,11 @@ func (s *session) Body(m *milter.Modifier) (milter.Response, error) {
 		return nil, err
 	}
 
-	for _, index := range s.authResDelete {
+	// Delete header fields from bottom to top so removing one field does not
+	// shift the absolute indices of the remaining ones.
+	deleteIndices := append([]int(nil), s.authResDelete...)
+	sort.Sort(sort.Reverse(sort.IntSlice(deleteIndices)))
+	for _, index := range deleteIndices {
 		if err := m.ChangeHeader(index, "Authentication-Results", ""); err != nil {
 			return nil, err
 		}

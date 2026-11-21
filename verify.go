@@ -90,7 +90,9 @@ type signature struct {
 // Verify checks if a message's signatures are valid. It returns one
 // verification per signature.
 //
-// There is no guarantee that the reader will be completely consumed.
+// The reader is fully consumed: the whole body is buffered before the
+// signatures are checked, so each verification (and any retry or restart of
+// it) operates on the exact same message bytes and signed header scope.
 func Verify(r io.Reader) ([]*Verification, error) {
 	// TODO: be able to specify options such as the max number of signatures to
 	// check
@@ -111,25 +113,22 @@ func Verify(r io.Reader) ([]*Verification, error) {
 		}
 	}
 
-	// Copy body in a buffer if multiple signatures are checked
-	var br *bytes.Reader
-	if len(signatures) > 1 {
-		b, err := ioutil.ReadAll(bufr)
-		if err != nil {
-			return nil, err
-		}
-		br = bytes.NewReader(b)
+	// Copy the whole body in a buffer, so each signature gets its own
+	// re-readable reader. This makes verification independent from the way the
+	// reader is consumed: retrying the verification (e.g. after a temporary
+	// DNS failure, a milter re-drive or a process restart) always hashes the
+	// exact same body bytes and reproduces the same signed scope, instead of
+	// silently reading an empty or partial body on the second attempt.
+	body, err := ioutil.ReadAll(bufr)
+	if err != nil {
+		return nil, err
 	}
 
 	verifications := make([]*Verification, len(signatures))
 	for i, sig := range signatures {
-		// Use the bytes.Reader if there is one
-		var r io.Reader = bufr
-		if br != nil {
-			br.Seek(0, io.SeekStart)
-			r = br
-		}
-
+		// Use a dedicated reader for each signature: a shared reader cannot
+		// be safely re-read or consumed by more than one verification.
+		r := bytes.NewReader(body)
 		v, err := verify(h, r, h[sig.i], sig.v)
 		if err != nil && !IsTempFail(err) && !IsPermFail(err) && !isFail(err) {
 			return verifications, err

@@ -124,21 +124,37 @@ func formatHeaderParams(params map[string]string) string {
 }
 
 type headerPicker struct {
-	h      header
-	picked map[string]int
+	h header
+	// next contains the index of the first header field to inspect on the
+	// next Pick call, for each lower-cased header field name. Each Pick only
+	// walks the header fields above the previously picked one, so the picked
+	// fields are deterministically bound to their position in the header.
+	// This keeps the mapping between the "h=" tag list and the signed header
+	// fields stable across retries: re-running Pick on the same header always
+	// selects the exact same header field instances, even if additional
+	// fields sharing a signed name have been injected into the message.
+	next map[string]int
 }
 
 func newHeaderPicker(h header) *headerPicker {
 	return &headerPicker{
-		h:      h,
-		picked: make(map[string]int),
+		h:    h,
+		next: make(map[string]int),
 	}
 }
 
 func (p *headerPicker) Pick(key string) string {
 	key = strings.ToLower(key)
-	at := p.picked[key]
-	for i := len(p.h) - 1; i >= 0; i-- {
+	// RFC 6376 section 3.7: header fields are identified by field name and
+	// the header fields are presented to the signing/verification algorithm
+	// from the bottom of the header block to the top. The first call for a
+	// given name starts at the end of the header block, subsequent calls
+	// continue right above the field returned by the previous call.
+	at, ok := p.next[key]
+	if !ok {
+		at = len(p.h)
+	}
+	for i := at - 1; i >= 0; i-- {
 		kv := p.h[i]
 		k, _ := parseHeaderField(kv)
 
@@ -146,11 +162,11 @@ func (p *headerPicker) Pick(key string) string {
 			continue
 		}
 
-		if at == 0 {
-			p.picked[key]++
-			return kv
-		}
-		at--
+		// Bind this "h=" entry to the concrete header field at index i: the
+		// next call for the same name must not consider this field nor any
+		// field below it again.
+		p.next[key] = i
+		return kv
 	}
 
 	return ""
