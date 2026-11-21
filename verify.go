@@ -57,6 +57,14 @@ func isFail(err error) bool {
 
 var requiredTags = []string{"v", "a", "b", "bh", "d", "h", "s"}
 
+// VerifyOptions configures VerifyWithOptions.
+type VerifyOptions struct {
+	// Reports, if true, attaches a detailed VerifyReport to each returned
+	// Verification. The report retains the selector, key fingerprint, message
+	// digests and the verification stage reached.
+	Reports bool
+}
+
 // A Verification is produced by Verify when it checks if one signature is
 // valid. If the signature is valid, Err is nil.
 type Verification struct {
@@ -80,6 +88,15 @@ type Verification struct {
 
 	// Err is nil if the signature is valid.
 	Err error
+
+	// Selector is the selector ("s=") claimed by the signature.
+	Selector string
+
+	// Report is the detailed verification report. It is only populated when
+	// Verify is called through VerifyWithOptions with Reports enabled;
+	// otherwise it stays nil so that the historical Verification values keep
+	// comparing equal.
+	Report *VerifyReport
 }
 
 type signature struct {
@@ -92,6 +109,16 @@ type signature struct {
 //
 // There is no guarantee that the reader will be completely consumed.
 func Verify(r io.Reader) ([]*Verification, error) {
+	return VerifyWithOptions(r, nil)
+}
+
+// VerifyWithOptions behaves like Verify but, when opts.Reports is true,
+// attaches a VerifyReport to every returned Verification. The report records
+// the selector, the public key fingerprint, the message digests and the stage
+// reached, and on failure its Err points at the exact failing stage.
+func VerifyWithOptions(r io.Reader, opts *VerifyOptions) ([]*Verification, error) {
+	withReports := opts != nil && opts.Reports
+
 	// TODO: be able to specify options such as the max number of signatures to
 	// check
 
@@ -130,41 +157,55 @@ func Verify(r io.Reader) ([]*Verification, error) {
 			r = br
 		}
 
-		v, err := verify(h, r, h[sig.i], sig.v)
+		var report *VerifyReport
+		if withReports {
+			report = &VerifyReport{}
+		}
+		v, err := verify(h, r, h[sig.i], sig.v, report)
 		if err != nil && !IsTempFail(err) && !IsPermFail(err) && !isFail(err) {
 			return verifications, err
 		}
 
+		if report != nil {
+			report.Err = err
+			v.Report = report
+		}
 		v.Err = err
 		verifications[i] = v
 	}
 	return verifications, nil
 }
 
-func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, error) {
+func verify(h header, r io.Reader, sigField, sigValue string, report *VerifyReport) (*Verification, error) {
 	verif := new(Verification)
+	report.setStage(VerificationStageParse)
 
 	params, err := parseHeaderParams(sigValue)
 	if err != nil {
-		return verif, permFailError("malformed signature tags: " + err.Error())
+		return verif, report.fail(VerificationStageParse, permFailError("malformed signature tags: "+err.Error()))
 	}
 
 	if params["v"] != "1" {
-		return verif, permFailError("incompatible signature version")
+		return verif, report.fail(VerificationStageParse, permFailError("incompatible signature version"))
 	}
 
 	verif.Domain = stripWhitespace(params["d"])
+	verif.Selector = stripWhitespace(params["s"])
+	if report != nil {
+		report.Domain = verif.Domain
+		report.Selector = verif.Selector
+	}
 
 	for _, tag := range requiredTags {
 		if _, ok := params[tag]; !ok {
-			return verif, permFailError("signature missing required tag")
+			return verif, report.fail(VerificationStageParse, permFailError("signature missing required tag"))
 		}
 	}
 
 	if i, ok := params["i"]; ok {
 		verif.Identifier = stripWhitespace(i)
 		if !strings.HasSuffix(verif.Identifier, "@"+verif.Domain) && !strings.HasSuffix(verif.Identifier, "."+verif.Domain) {
-			return verif, permFailError("domain mismatch")
+			return verif, report.fail(VerificationStageParse, permFailError("domain mismatch"))
 		}
 	} else {
 		verif.Identifier = "@" + verif.Domain
@@ -179,30 +220,31 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 		}
 	}
 	if !ok {
-		return verif, permFailError("From field not signed")
+		return verif, report.fail(VerificationStageParse, permFailError("From field not signed"))
 	}
 	verif.HeaderKeys = headerKeys
 
 	if timeStr, ok := params["t"]; ok {
 		t, err := parseTime(timeStr)
 		if err != nil {
-			return verif, permFailError("malformed time: " + err.Error())
+			return verif, report.fail(VerificationStageParse, permFailError("malformed time: "+err.Error()))
 		}
 		verif.Time = t
 	}
 	if expiresStr, ok := params["x"]; ok {
 		t, err := parseTime(expiresStr)
 		if err != nil {
-			return verif, permFailError("malformed expiration time: " + err.Error())
+			return verif, report.fail(VerificationStageParse, permFailError("malformed expiration time: "+err.Error()))
 		}
 		verif.Expiration = t
 		if now().After(t) {
-			return verif, permFailError("signature has expired")
+			return verif, report.fail(VerificationStageParse, permFailError("signature has expired"))
 		}
 	}
 
 	// Query public key
 	// TODO: compute hash in parallel
+	report.setStage(VerificationStageKeyQuery)
 	methods := []string{string(QueryMethodDNSTXT)}
 	if methodsStr, ok := params["q"]; ok {
 		methods = parseTagList(methodsStr)
@@ -215,15 +257,22 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 		}
 	}
 	if err != nil {
-		return verif, err
+		return verif, report.fail(VerificationStageKeyQuery, err)
 	} else if res == nil {
-		return verif, permFailError("unsupported public key query method")
+		return verif, report.fail(VerificationStageKeyQuery, permFailError("unsupported public key query method"))
+	}
+	if report != nil {
+		fingerprint, fpErr := PublicKeyFingerprint(res.Verifier.Public())
+		if fpErr != nil {
+			return verif, report.fail(VerificationStageKeyQuery, fpErr)
+		}
+		report.KeyFingerprint = fingerprint
 	}
 
 	// Parse algos
 	algos := strings.SplitN(stripWhitespace(params["a"]), "-", 2)
 	if len(algos) != 2 {
-		return verif, permFailError("malformed algorithm name")
+		return verif, report.fail(VerificationStageParse, permFailError("malformed algorithm name"))
 	}
 	keyAlgo := algos[0]
 	hashAlgo := algos[1]
@@ -238,7 +287,7 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 			}
 		}
 		if !ok {
-			return verif, permFailError("inappropriate hash algorithm")
+			return verif, report.fail(VerificationStageParse, permFailError("inappropriate hash algorithm"))
 		}
 	}
 	var hash crypto.Hash
@@ -246,16 +295,16 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 	case "sha1":
 		// RFC 8301 section 3.1: rsa-sha1 MUST NOT be used for signing or
 		// verifying.
-		return verif, permFailError(fmt.Sprintf("hash algorithm too weak: %v", hashAlgo))
+		return verif, report.fail(VerificationStageParse, permFailError(fmt.Sprintf("hash algorithm too weak: %v", hashAlgo)))
 	case "sha256":
 		hash = crypto.SHA256
 	default:
-		return verif, permFailError("unsupported hash algorithm")
+		return verif, report.fail(VerificationStageParse, permFailError("unsupported hash algorithm"))
 	}
 
 	// Check key algo
 	if res.KeyAlgo != keyAlgo {
-		return verif, permFailError("inappropriate key algorithm")
+		return verif, report.fail(VerificationStageParse, permFailError("inappropriate key algorithm"))
 	}
 
 	if res.Services != nil {
@@ -267,25 +316,25 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 			}
 		}
 		if !ok {
-			return verif, permFailError("inappropriate service")
+			return verif, report.fail(VerificationStageParse, permFailError("inappropriate service"))
 		}
 	}
 
 	headerCan, bodyCan := parseCanonicalization(params["c"])
 	if _, ok := canonicalizers[headerCan]; !ok {
-		return verif, permFailError("unsupported header canonicalization algorithm")
+		return verif, report.fail(VerificationStageParse, permFailError("unsupported header canonicalization algorithm"))
 	}
 	if _, ok := canonicalizers[bodyCan]; !ok {
-		return verif, permFailError("unsupported body canonicalization algorithm")
+		return verif, report.fail(VerificationStageParse, permFailError("unsupported body canonicalization algorithm"))
 	}
 
 	var bodyLen int64 = -1
 	if lenStr, ok := params["l"]; ok {
 		l, err := strconv.ParseInt(stripWhitespace(lenStr), 10, 64)
 		if err != nil {
-			return verif, permFailError("malformed body length: " + err.Error())
+			return verif, report.fail(VerificationStageParse, permFailError("malformed body length: "+err.Error()))
 		} else if l < 0 {
-			return verif, permFailError("malformed body length: negative value")
+			return verif, report.fail(VerificationStageParse, permFailError("malformed body length: negative value"))
 		}
 		bodyLen = l
 	}
@@ -294,14 +343,18 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 	// Parse body hash and signature
 	bodyHashed, err := decodeBase64String(params["bh"])
 	if err != nil {
-		return verif, permFailError("malformed body hash: " + err.Error())
+		return verif, report.fail(VerificationStageParse, permFailError("malformed body hash: "+err.Error()))
 	}
 	sig, err := decodeBase64String(params["b"])
 	if err != nil {
-		return verif, permFailError("malformed signature: " + err.Error())
+		return verif, report.fail(VerificationStageParse, permFailError("malformed signature: "+err.Error()))
+	}
+	if report != nil {
+		report.BodyDigest = encodeDigest(bodyHashed)
 	}
 
 	// Check body hash
+	report.setStage(VerificationStageBodyHash)
 	hasher := hash.New()
 	var w io.Writer = hasher
 	if bodyLen >= 0 {
@@ -309,16 +362,17 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 	}
 	wc := canonicalizers[bodyCan].CanonicalizeBody(w)
 	if _, err := io.Copy(wc, r); err != nil {
-		return verif, err
+		return verif, report.fail(VerificationStageBodyHash, err)
 	}
 	if err := wc.Close(); err != nil {
-		return verif, err
+		return verif, report.fail(VerificationStageBodyHash, err)
 	}
 	if subtle.ConstantTimeCompare(hasher.Sum(nil), bodyHashed) != 1 {
-		return verif, failError("body hash did not verify")
+		return verif, report.fail(VerificationStageBodyHash, failError("body hash did not verify"))
 	}
 
 	// Compute data hash
+	report.setStage(VerificationStageHeaderHash)
 	hasher.Reset()
 	picker := newHeaderPicker(h)
 	for _, key := range headerKeys {
@@ -332,20 +386,24 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 
 		kv = canonicalizers[headerCan].CanonicalizeHeader(kv)
 		if _, err := hasher.Write([]byte(kv)); err != nil {
-			return verif, err
+			return verif, report.fail(VerificationStageHeaderHash, err)
 		}
 	}
 	canSigField := removeSignature(sigField)
 	canSigField = canonicalizers[headerCan].CanonicalizeHeader(canSigField)
 	canSigField = strings.TrimRight(canSigField, "\r\n")
 	if _, err := hasher.Write([]byte(canSigField)); err != nil {
-		return verif, err
+		return verif, report.fail(VerificationStageHeaderHash, err)
 	}
 	hashed := hasher.Sum(nil)
+	if report != nil {
+		report.HeaderDigest = encodeDigest(hashed)
+	}
 
 	// Check signature
+	report.setStage(VerificationStageCryptoVerify)
 	if err := res.Verifier.Verify(hash, hashed, sig); err != nil {
-		return verif, failError("signature did not verify: " + err.Error())
+		return verif, report.fail(VerificationStageCryptoVerify, failError("signature did not verify: "+err.Error()))
 	}
 
 	return verif, nil

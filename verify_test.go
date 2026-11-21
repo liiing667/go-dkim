@@ -37,6 +37,7 @@ var testVerification = &Verification{
 	Identifier: "joe@football.example.com",
 	HeaderKeys: []string{"Received", "From", "To", "Subject", "Date", "Message-ID"},
 	BodyLength: -1,
+	Selector:   "brisbane",
 }
 
 func newMailStringReader(s string) io.Reader {
@@ -92,6 +93,7 @@ var testEd25519Verification = &Verification{
 	HeaderKeys: []string{"from", "to", "subject", "date", "message-id", "from", "subject", "date"},
 	BodyLength: -1,
 	Time:       time.Unix(1528637909, 0),
+	Selector:   "brisbane",
 }
 
 func TestVerify_ed25519(t *testing.T) {

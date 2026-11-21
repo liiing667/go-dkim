@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto"
 	"crypto/x509"
 	"encoding/pem"
 	"flag"
@@ -33,7 +32,11 @@ var (
 	verbose        bool
 )
 
-var privateKey crypto.Signer
+// keyRing holds the configured signing key generation(s). It is populated once
+// at startup but each milter session takes an immutable snapshot of the current
+// generation before processing a message, so a rotation can never mix the
+// selector of one generation with the private key of another.
+var keyRing = dkim.NewKeyRing()
 
 var signHeaderKeys = []string{
 	"From",
@@ -83,6 +86,8 @@ type session struct {
 
 	signDomain     string
 	signHeaderKeys []string
+	signKey        *dkim.SigningKey
+	signReport     *dkim.SignReport
 
 	done   <-chan error
 	pw     *io.PipeWriter
@@ -168,15 +173,22 @@ func (s *session) Headers(h textproto.MIMEHeader, m *milter.Modifier) (milter.Re
 
 	// Sign if necessary
 	if s.signDomain != "" {
+		// Pin the current key generation for the whole session: retries and
+		// deferred signing in Body() all reuse this snapshot.
+		key, err := keyRing.Snapshot()
+		if err != nil {
+			return nil, err
+		}
+		s.signKey = key
+		s.signReport = &dkim.SignReport{}
 		opts := dkim.SignOptions{
-			Domain: s.signDomain,
-			Selector: selector,
-			Signer: privateKey,
-			HeaderKeys: s.signHeaderKeys,
+			Domain:       s.signDomain,
+			Key:          key,
+			HeaderKeys:   s.signHeaderKeys,
 			QueryMethods: []dkim.QueryMethod{dkim.QueryMethodDNSTXT},
+			Report:       s.signReport,
 		}
 
-		var err error
 		s.signer, err = dkim.NewSigner(&opts)
 		if err != nil {
 			return nil, err
@@ -193,7 +205,7 @@ func (s *session) Headers(h textproto.MIMEHeader, m *milter.Modifier) (milter.Re
 	// TODO: limit max. number of signatures
 	go func() {
 		var err error
-		s.verifs, err = dkim.Verify(pr)
+		s.verifs, err = dkim.VerifyWithOptions(pr, &dkim.VerifyOptions{Reports: true})
 		io.Copy(ioutil.Discard, pr)
 		pr.Close()
 		done <- err
@@ -237,7 +249,8 @@ func (s *session) Body(m *milter.Modifier) (milter.Response, error) {
 	if s.signer != nil {
 		if err := s.signer.Close(); err != nil {
 			if verbose {
-				log.Printf("DKIM signature failed: %v", err)
+				log.Printf("DKIM signature failed at stage %q (selector %q, key %v): %v",
+					s.signReport.Stage, s.signReport.Selector, s.signReport.KeyFingerprint, err)
 			}
 			return nil, err
 		}
@@ -265,9 +278,15 @@ func (s *session) Body(m *milter.Modifier) (milter.Response, error) {
 	for _, verif := range s.verifs {
 		if verbose {
 			if verif.Err != nil {
-				log.Printf("DKIM verification failed for %v: %v", verif.Domain, verif.Err)
+				stage := ""
+				if verif.Report != nil {
+					stage = string(verif.Report.Stage)
+				}
+				log.Printf("DKIM verification failed for %v (selector %q, stage %q): %v",
+					verif.Domain, verif.Selector, stage, verif.Err)
 			} else {
-				log.Printf("DKIM verification succeded for %v", verif.Domain)
+				log.Printf("DKIM verification succeded for %v (selector %q)",
+					verif.Domain, verif.Selector)
 			}
 		}
 
@@ -347,10 +366,12 @@ func main() {
 	}
 
 	if privateKeyPath != "" {
-		var err error
-		privateKey, err = loadPrivateKey(privateKeyPath)
+		signer, err := loadPrivateKey(privateKeyPath)
 		if err != nil {
 			log.Fatalf("Failed to load private key from '%v': %v", privateKeyPath, err)
+		}
+		if _, err := keyRing.Add(selector, signer); err != nil {
+			log.Fatalf("Failed to add signing key: %v", err)
 		}
 	}
 

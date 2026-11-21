@@ -27,6 +27,38 @@ if err := dkim.Sign(&b, r, options); err != nil {
 }
 ```
 
+### Key rotation and reports
+
+When the signing key is rotated, each signing session must keep using one key
+generation (selector + private key) for its whole lifetime — including
+retries after a transient failure. Use a `KeyRing`, take an immutable
+`SigningKey` snapshot per message and attach a `SignReport`:
+
+```go
+ring := dkim.NewKeyRing()
+if _, err := ring.Rotate("brisbane", privateKey); err != nil {
+	log.Fatal(err)
+}
+
+key, err := ring.Snapshot() // pinned generation; rotations don't affect it
+if err != nil {
+	log.Fatal(err)
+}
+
+report := &dkim.SignReport{}
+err = dkim.Sign(w, r, &dkim.SignOptions{
+	Domain:     "example.org",
+	Key:        key,
+	MaxRetries: 2,
+	Report:     report,
+})
+```
+
+The report retains the selector, the public-key fingerprint, the body and
+header message digests and the pipeline stage reached; on failure it points
+at the exact failing stage. Verification reports are available through
+`VerifyWithOptions` with `VerifyOptions{Reports: true}`.
+
 ### Verify
 
 ```go

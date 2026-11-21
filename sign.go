@@ -5,21 +5,18 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/rand"
-	"crypto/rsa"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/crypto/ed25519"
 )
 
 var randReader io.Reader = rand.Reader
 
-// SignOptions is used to configure Sign. Domain, Selector and Signer are
-// mandatory.
+// SignOptions is used to configure Sign. Domain is mandatory, and either a
+// SigningKey (Key) or both Selector and Signer must be provided.
 type SignOptions struct {
 	// The SDID claiming responsibility for an introduction of a message into the
 	// mail stream. Hence, the SDID value is used to form the query for the public
@@ -43,6 +40,26 @@ type SignOptions struct {
 	// Supported Signer.Public() values are *rsa.PublicKey and
 	// ed25519.PublicKey.
 	Signer crypto.Signer
+	// Key optionally pins the whole signing session (selector, private key and
+	// key generation) to an immutable snapshot taken before the message is
+	// processed. When set, Selector and Signer are ignored: every signing
+	// attempt, including retries after a transient failure, keeps using the
+	// exact same key generation, so a concurrent key rotation can never make
+	// the signature value come from another private key than the selector
+	// advertised in the DKIM-Signature header field.
+	Key *SigningKey
+
+	// Report, if non-nil, is populated while the message flows through the
+	// signing pipeline. It retains the selector, key fingerprint, message
+	// digests and the stage reached, and on failure it points at the exact
+	// failing stage.
+	Report *SignReport
+
+	// MaxRetries is the number of additional attempts allowed when the private
+	// key operation fails transiently. Zero means a single attempt (no retry),
+	// which preserves the historical behavior. Retries reuse the pinned Key
+	// snapshot and the already computed message hashes.
+	MaxRetries int
 	// The hash algorithm used to sign the message. If zero, a default hash will
 	// be chosen.
 	//
@@ -80,9 +97,11 @@ type SignOptions struct {
 // After a successful Close, Signature can be called to retrieve the
 // DKIM-Signature header field that the caller should prepend to the message.
 type Signer struct {
-	pw   *io.PipeWriter
-	done <-chan error
-	sig  string // only valid after done received nil
+	pw          *io.PipeWriter
+	done        <-chan error
+	sig         string // only valid after done received nil
+	report      *SignReport
+	maxAttempts int
 }
 
 // NewSigner creates a new signer. It returns an error if SignOptions is
@@ -94,11 +113,35 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 	if options.Domain == "" {
 		return nil, fmt.Errorf("dkim: no domain specified")
 	}
-	if options.Selector == "" {
-		return nil, fmt.Errorf("dkim: no selector specified")
+
+	// Pin the key generation before anything else. A SigningKey snapshot is
+	// immutable, so retries cannot accidentally pick up a rotated private key
+	// while the selector still names the old generation.
+	key := options.Key
+	if key == nil {
+		var err error
+		key, err = NewSigningKey(options.Selector, options.Signer)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if options.Signer == nil {
-		return nil, fmt.Errorf("dkim: no signer specified")
+
+	report := options.Report
+	if report == nil {
+		report = &SignReport{}
+	}
+	report.Domain = options.Domain
+	report.Selector = key.Selector()
+	report.KeyGeneration = key.Generation()
+	fingerprint, err := key.Fingerprint()
+	if err != nil {
+		report.Err = newStageError(string(SigningStageOptions), err)
+		return nil, err
+	}
+	report.KeyFingerprint = fingerprint
+	report.Stage = SigningStageOptions
+	if options.MaxRetries < 0 {
+		options.MaxRetries = 0
 	}
 
 	headerCan := options.HeaderCanonicalization
@@ -117,14 +160,9 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		return nil, fmt.Errorf("dkim: unknown body canonicalization %q", bodyCan)
 	}
 
-	var keyAlgo string
-	switch options.Signer.Public().(type) {
-	case *rsa.PublicKey:
-		keyAlgo = "rsa"
-	case ed25519.PublicKey:
-		keyAlgo = "ed25519"
-	default:
-		return nil, fmt.Errorf("dkim: unsupported key algorithm %T", options.Signer.Public())
+	keyAlgo, err := key.supportedKeyAlgo()
+	if err != nil {
+		return nil, err
 	}
 
 	hash := options.Hash
@@ -158,8 +196,10 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 	pr, pw := io.Pipe()
 
 	s := &Signer{
-		pw:   pw,
-		done: done,
+		pw:          pw,
+		done:        done,
+		report:      report,
+		maxAttempts: options.MaxRetries + 1,
 	}
 
 	closeReadWithError := func(err error) {
@@ -168,35 +208,38 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 	}
 
 	go func() {
+		report.setStage(SigningStageReadHeader)
 		// Read header
 		br := bufio.NewReader(pr)
 		h, err := readHeader(br)
 		if err != nil {
-			closeReadWithError(err)
+			closeReadWithError(report.fail(SigningStageReadHeader, err))
 			return
 		}
 
 		// Hash body
+		report.setStage(SigningStageBodyHash)
 		hasher := hash.New()
 		can := canonicalizers[bodyCan].CanonicalizeBody(hasher)
 		if _, err := io.Copy(can, br); err != nil {
-			closeReadWithError(err)
+			closeReadWithError(report.fail(SigningStageBodyHash, err))
 			return
 		}
 		if err := can.Close(); err != nil {
-			closeReadWithError(err)
+			closeReadWithError(report.fail(SigningStageBodyHash, err))
 			return
 		}
 		bodyHashed := hasher.Sum(nil)
+		report.BodyDigest = encodeDigest(bodyHashed)
 
 		params := map[string]string{
 			"v":  "1",
 			"a":  keyAlgo + "-" + hashAlgo,
-			"bh": base64.StdEncoding.EncodeToString(bodyHashed),
+			"bh": report.BodyDigest,
 			"c":  string(headerCan) + "/" + string(bodyCan),
 			"d":  options.Domain,
 			//"l": "", // TODO
-			"s": options.Selector,
+			"s": key.Selector(),
 			"t": formatTime(now()),
 			//"z": "", // TODO
 		}
@@ -229,6 +272,7 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		}
 
 		// Hash and sign headers
+		report.setStage(SigningStageHeaderHash)
 		hasher.Reset()
 		picker := newHeaderPicker(h)
 		for _, k := range headerKeys {
@@ -243,7 +287,7 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 
 			kv = canonicalizers[headerCan].CanonicalizeHeader(kv)
 			if _, err := io.WriteString(hasher, kv); err != nil {
-				closeReadWithError(err)
+				closeReadWithError(report.fail(SigningStageHeaderHash, err))
 				return
 			}
 		}
@@ -253,16 +297,31 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		sigField = canonicalizers[headerCan].CanonicalizeHeader(sigField)
 		sigField = strings.TrimRight(sigField, crlf)
 		if _, err := io.WriteString(hasher, sigField); err != nil {
-			closeReadWithError(err)
+			closeReadWithError(report.fail(SigningStageHeaderHash, err))
 			return
 		}
 		hashed := hasher.Sum(nil)
+		report.HeaderDigest = encodeDigest(hashed)
 
-		sig, err := options.Signer.Sign(randReader, hashed, hash)
-		if err != nil {
-			closeReadWithError(err)
-			return
+		// Sign with the pinned key generation. The message snapshot (hashes)
+		// is computed once: retries only re-run the private-key operation, so
+		// a transient crypto failure can never mix selector and key material
+		// from different generations.
+		report.setStage(SigningStageCryptoSign)
+		var sig []byte
+		for attempt := 1; attempt <= s.maxAttempts; attempt++ {
+			report.Attempts = attempt
+			sig, err = key.Signer().Sign(randReader, hashed, hash)
+			if err == nil {
+				break
+			}
+			if attempt == s.maxAttempts {
+				closeReadWithError(report.fail(SigningStageCryptoSign, err))
+				return
+			}
 		}
+
+		report.setStage(SigningStageFormat)
 		params["b"] = base64.StdEncoding.EncodeToString(sig)
 
 		s.sig = formatSignature(params)
@@ -296,6 +355,13 @@ func (s *Signer) Signature() string {
 		panic("dkim: Signer.Signature must only be called after a succesful Signer.Close")
 	}
 	return s.sig
+}
+
+// Report returns the report of the signing run. It can be called after Close.
+// The returned pointer is the SignOptions.Report value when one was provided,
+// otherwise it's an internally allocated report.
+func (s *Signer) Report() *SignReport {
+	return s.report
 }
 
 // Sign signs a message. It reads it from r and writes the signed version to w.
