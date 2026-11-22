@@ -75,6 +75,31 @@ func parseHeaderField(s string) (k string, v string) {
 	return
 }
 
+// HeaderInstance describes one concrete occurrence of a header field in the
+// message generation consumed by a signature.
+type HeaderInstance struct {
+	// Index is the zero-based position of the header field in the complete
+	// message header block.
+	Index int
+	// Name is the header field name as it appeared in the message.
+	Name string
+	// Value is the field value. Folded continuation lines are preserved.
+	Value string
+	// Raw is the complete header field, including folded whitespace and its
+	// trailing CRLF.
+	Raw string
+}
+
+func newHeaderInstance(index int, kv string) HeaderInstance {
+	k, v := parseHeaderField(kv)
+	return HeaderInstance{
+		Index: index,
+		Name:  k,
+		Value: v,
+		Raw:   kv,
+	}
+}
+
 func parseHeaderParams(s string) (map[string]string, error) {
 	pairs := strings.Split(s, ";")
 	params := make(map[string]string)
@@ -124,34 +149,75 @@ func formatHeaderParams(params map[string]string) string {
 }
 
 type headerPicker struct {
-	h      header
-	picked map[string]int
+	h header
+	// next maps a lower-case field name to the exclusive upper bound of the
+	// next search. It only moves when a concrete header instance is selected.
+	// Missing fields therefore do not consume an occurrence.
+	next map[string]int
 }
 
 func newHeaderPicker(h header) *headerPicker {
 	return &headerPicker{
-		h:      h,
-		picked: make(map[string]int),
+		// Keep the parsed header block immutable for the lifetime of the
+		// picker. A message generation must not change underneath a signature
+		// binding.
+		h:    append(header(nil), h...),
+		next: make(map[string]int),
 	}
 }
 
-func (p *headerPicker) Pick(key string) string {
-	key = strings.ToLower(key)
-	at := p.picked[key]
-	for i := len(p.h) - 1; i >= 0; i-- {
+func (p *headerPicker) pick(key string) (HeaderInstance, bool) {
+	key = strings.ToLower(strings.TrimSpace(key))
+	at, ok := p.next[key]
+	if !ok {
+		at = len(p.h)
+	}
+	for i := at - 1; i >= 0; i-- {
 		kv := p.h[i]
 		k, _ := parseHeaderField(kv)
 
-		if strings.ToLower(k) != key {
+		if !strings.EqualFold(k, key) {
 			continue
 		}
 
-		if at == 0 {
-			p.picked[key]++
-			return kv
-		}
-		at--
+		// Bind this h= entry to the concrete header field at index i. The
+		// next pick for the same name must continue above this field.
+		p.next[key] = i
+		return newHeaderInstance(i, kv), true
 	}
 
-	return ""
+	return HeaderInstance{}, false
+}
+
+func (p *headerPicker) Pick(key string) string {
+	instance, ok := p.pick(key)
+	if !ok {
+		return ""
+	}
+	return instance.Raw
+}
+
+// Bind resolves keys against the picker's immutable header snapshot. It
+// creates a fresh cursor and therefore always returns the same binding for the
+// same header block and declaration order, even when called repeatedly.
+func (p *headerPicker) Bind(keys []string) []HeaderInstance {
+	return bindHeaderInstances(p.h, keys)
+}
+
+// bindHeaderInstances resolves every h= entry against one message generation.
+// The returned instances are in declaration order and each entry is bound to
+// exactly one physical header occurrence.
+func bindHeaderInstances(h header, keys []string) []HeaderInstance {
+	picker := newHeaderPicker(h)
+	instances := make([]HeaderInstance, 0, len(keys))
+	for _, key := range keys {
+		instance, ok := picker.pick(key)
+		if !ok {
+			// RFC 6376 permits h= entries for fields that do not exist when
+			// signing. They consume no header instance.
+			continue
+		}
+		instances = append(instances, instance)
+	}
+	return instances
 }

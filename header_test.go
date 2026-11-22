@@ -102,3 +102,79 @@ func TestHeaderPicker_Pick(t *testing.T) {
 
 	})
 }
+
+func TestHeaderPicker_DeclarationOrderBindsConcreteInstances(t *testing.T) {
+	headers := header{
+		"From: top\r\n",
+		"Received: first\r\n",
+		"Subject: s\r\n",
+		"Received: second\r\n",
+		"To: bottom\r\n",
+	}
+	keys := []string{"To", "Received", "Subject", "Received", "From", "Received"}
+	want := []struct {
+		index int
+		name  string
+		raw   string
+	}{
+		{4, "To", "To: bottom\r\n"},
+		{3, "Received", "Received: second\r\n"},
+		{2, "Subject", "Subject: s\r\n"},
+		{1, "Received", "Received: first\r\n"},
+		{0, "From", "From: top\r\n"},
+	}
+
+	picker := newHeaderPicker(headers)
+	for i, key := range keys {
+		instance, ok := picker.pick(key)
+		if i == len(want) {
+			if ok {
+				t.Errorf("Expected the sixth Received to be missing, got %+v", instance)
+			}
+			continue
+		}
+		if !ok {
+			t.Fatalf("Pick(%q) #%v did not find a header", key, i)
+		}
+		if instance.Index != want[i].index || instance.Name != want[i].name || instance.Raw != want[i].raw {
+			t.Errorf("Pick(%q) #%v = %+v, want index=%v name=%q raw=%q",
+				key, i, instance, want[i].index, want[i].name, want[i].raw)
+		}
+	}
+}
+
+func TestHeaderPicker_BindIsStableAcrossRetries(t *testing.T) {
+	headers := header{
+		"Received: first\r\n",
+		"From: sender@example.org\r\n",
+		"Received: second\r\n",
+	}
+	keys := []string{"Received", "From", "Received"}
+
+	picker := newHeaderPicker(headers)
+	first := picker.Bind(keys)
+	second := picker.Bind(keys)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("Expected stable bindings across retries, got\n%+v\nand\n%+v", first, second)
+	}
+	if len(first) != 3 {
+		t.Fatalf("Expected three bound instances, got %+v", first)
+	}
+	if first[0].Raw != "Received: second\r\n" || first[2].Raw != "Received: first\r\n" {
+		t.Errorf("Expected duplicate Received fields to be consumed bottom-up, got %+v", first)
+	}
+}
+
+func TestHeaderPicker_PreservesFoldedWhitespace(t *testing.T) {
+	headers := header{
+		"Subject: Hello\r\n\t world  again\r\n",
+	}
+	picker := newHeaderPicker(headers)
+	instance, ok := picker.pick("subject")
+	if !ok {
+		t.Fatal("Expected to find the folded Subject field")
+	}
+	if instance.Raw != headers[0] {
+		t.Errorf("Expected folded field to be preserved as %q, got %q", headers[0], instance.Raw)
+	}
+}

@@ -106,22 +106,29 @@ func (c *relaxedCanonicalizer) CanonicalizeHeader(s string) string {
 	if len(kv) > 1 {
 		v = kv[1]
 	}
-	lines := strings.Split(v, crlf)
-	lines[0] = strings.TrimLeft(lines[0], " \t")
 
-	v = ""
-	for _, l := range lines {
-		if len(l) == 0 {
-			break
+	// Unfold the value and reduce every run of folding whitespace to one
+	// space. Leading and trailing whitespace is removed. This keeps simple
+	// canonicalization byte-for-byte while relaxed canonicalization has one
+	// stable representation regardless of where the sender folded the field.
+	var value strings.Builder
+	pendingWSP := false
+	wroteValue := false
+	for i := 0; i < len(v); i++ {
+		switch v[i] {
+		case ' ', '\t', '\r', '\n':
+			pendingWSP = true
+		default:
+			if pendingWSP && wroteValue {
+				value.WriteByte(' ')
+			}
+			pendingWSP = false
+			value.WriteByte(v[i])
+			wroteValue = true
 		}
-
-		if l[0] == ' ' || l[0] == '\t' {
-			v += " "
-		}
-		v += strings.Trim(l, " \t")
 	}
 
-	return k + ":" + v + crlf
+	return k + ":" + value.String() + crlf
 }
 
 type relaxedBodyCanonicalizer struct {

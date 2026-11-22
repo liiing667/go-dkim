@@ -80,9 +80,10 @@ type SignOptions struct {
 // After a successful Close, Signature can be called to retrieve the
 // DKIM-Signature header field that the caller should prepend to the message.
 type Signer struct {
-	pw   *io.PipeWriter
-	done <-chan error
-	sig  string // only valid after done received nil
+	pw      *io.PipeWriter
+	done    <-chan error
+	sig     string           // only valid after done received nil
+	headers []HeaderInstance // only valid after done received nil
 }
 
 // NewSigner creates a new signer. It returns an error if SignOptions is
@@ -154,6 +155,18 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		}
 	}
 
+	// Freeze the signing declaration before the background goroutine starts.
+	// Header selection, h= and the final signature must not observe later
+	// caller mutations of the options or their slices.
+	opts := *options
+	if options.HeaderKeys != nil {
+		opts.HeaderKeys = append([]string{}, options.HeaderKeys...)
+	}
+	if options.QueryMethods != nil {
+		opts.QueryMethods = append([]QueryMethod{}, options.QueryMethods...)
+	}
+	options = &opts
+
 	done := make(chan error, 1)
 	pr, pw := io.Pipe()
 
@@ -203,7 +216,7 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 
 		var headerKeys []string
 		if options.HeaderKeys != nil {
-			headerKeys = options.HeaderKeys
+			headerKeys = append([]string(nil), options.HeaderKeys...)
 		} else {
 			for _, kv := range h {
 				k, _ := parseHeaderField(kv)
@@ -228,44 +241,65 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 			params["x"] = formatTime(options.Expiration)
 		}
 
+		// Build the signed header list once. Both the declaration in h= and
+		// the concrete header instances hashed below come from this binding,
+		// so retries cannot silently move to the next duplicate header.
+		instances := bindHeaderInstances(h, headerKeys)
+
+		// Reserve the final base64 size of b= before hashing. This makes the
+		// folded signature field used for hashing byte-for-byte identical to
+		// the field returned by Signature(), except for the b= value itself.
+		signatureLen, err := encodedSignatureLength(options.Signer)
+		if err != nil {
+			closeReadWithError(err)
+			return
+		}
+		params["b"] = strings.Repeat("A", signatureLen)
+		sigField := formatSignature(params)
+
+		// Hash the same wire representation that will be emitted. Deleting
+		// the b= value leaves the folding of every other tag untouched.
+		hashField := removeSignature(sigField)
+		hashField = canonicalizers[headerCan].CanonicalizeHeader(hashField)
+		hashField = strings.TrimRight(hashField, crlf)
+
 		// Hash and sign headers
 		hasher.Reset()
-		picker := newHeaderPicker(h)
-		for _, k := range headerKeys {
-			kv := picker.Pick(k)
-			if kv == "" {
-				// The Signer MAY include more instances of a header field name
-				// in "h=" than there are actual corresponding header fields so
-				// that the signature will not verify if additional header
-				// fields of that name are added.
-				continue
-			}
-
-			kv = canonicalizers[headerCan].CanonicalizeHeader(kv)
+		for _, instance := range instances {
+			kv := canonicalizers[headerCan].CanonicalizeHeader(instance.Raw)
 			if _, err := io.WriteString(hasher, kv); err != nil {
 				closeReadWithError(err)
 				return
 			}
 		}
 
-		params["b"] = ""
-		sigField := formatSignature(params)
-		sigField = canonicalizers[headerCan].CanonicalizeHeader(sigField)
-		sigField = strings.TrimRight(sigField, crlf)
-		if _, err := io.WriteString(hasher, sigField); err != nil {
+		if _, err := io.WriteString(hasher, hashField); err != nil {
 			closeReadWithError(err)
 			return
 		}
 		hashed := hasher.Sum(nil)
 
-		sig, err := options.Signer.Sign(randReader, hashed, hash)
+		signOpts := crypto.SignerOpts(hash)
+		if keyAlgo == "ed25519" {
+			// Ed25519 signs the supplied message directly. The DKIM message
+			// in this case is the SHA-256 digest computed above.
+			signOpts = crypto.Hash(0)
+		}
+		sig, err := options.Signer.Sign(randReader, hashed, signOpts)
 		if err != nil {
 			closeReadWithError(err)
 			return
 		}
-		params["b"] = base64.StdEncoding.EncodeToString(sig)
+		signature := base64.StdEncoding.EncodeToString(sig)
+		if len(signature) != signatureLen {
+			closeReadWithError(fmt.Errorf("dkim: signer returned an unexpected signature size: got %v bytes, want %v",
+				len(signature), signatureLen))
+			return
+		}
+		params["b"] = signature
 
 		s.sig = formatSignature(params)
+		s.headers = append([]HeaderInstance(nil), instances...)
 		closeReadWithError(nil)
 		close(done)
 	}()
@@ -298,6 +332,17 @@ func (s *Signer) Signature() string {
 	return s.sig
 }
 
+// HeaderInstances returns the concrete header field occurrences consumed by
+// this signature. Indexes refer to the input header block, before the caller
+// prepends the new DKIM-Signature field. It can only be called after a
+// successful Signer.Close call.
+func (s *Signer) HeaderInstances() []HeaderInstance {
+	if s.sig == "" {
+		panic("dkim: Signer.HeaderInstances must only be called after a succesful Signer.Close")
+	}
+	return append([]HeaderInstance(nil), s.headers...)
+}
+
 // Sign signs a message. It reads it from r and writes the signed version to w.
 func Sign(w io.Writer, r io.Reader, options *SignOptions) error {
 	s, err := NewSigner(options)
@@ -328,6 +373,17 @@ func Sign(w io.Writer, r io.Reader, options *SignOptions) error {
 func formatSignature(params map[string]string) string {
 	sig := headerFieldName + ": " + formatHeaderParams(params)
 	return foldHeaderField(sig)
+}
+
+func encodedSignatureLength(signer crypto.Signer) (int, error) {
+	switch pub := signer.Public().(type) {
+	case *rsa.PublicKey:
+		return base64.StdEncoding.EncodedLen(pub.Size()), nil
+	case ed25519.PublicKey:
+		return base64.StdEncoding.EncodedLen(ed25519.SignatureSize), nil
+	default:
+		return 0, fmt.Errorf("dkim: unsupported key algorithm %T", pub)
+	}
 }
 
 func formatTagList(l []string) string {

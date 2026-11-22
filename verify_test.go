@@ -54,8 +54,22 @@ func TestVerify(t *testing.T) {
 	}
 
 	v := verifications[0]
-	if !reflect.DeepEqual(testVerification, v) {
-		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", testVerification, v)
+	instances := v.HeaderInstances
+	got := *v
+	got.HeaderInstances = nil
+	if !reflect.DeepEqual(testVerification, &got) {
+		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", testVerification, &got)
+	}
+	if len(instances) != 6 {
+		t.Fatalf("Expected six consumed header instances, got %v", instances)
+	}
+	for i, name := range []string{"Received", "From", "To", "Subject", "Date", "Message-ID"} {
+		if instances[i].Index != i+1 {
+			t.Errorf("Expected instance %v at index %v, got %v", name, i+1, instances[i].Index)
+		}
+		if instances[i].Name != name {
+			t.Errorf("Expected instance name %q, got %q", name, instances[i].Name)
+		}
 	}
 }
 
@@ -105,7 +119,29 @@ func TestVerify_ed25519(t *testing.T) {
 	}
 
 	v := verifications[0]
-	if !reflect.DeepEqual(testEd25519Verification, v) {
-		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", testEd25519Verification, v)
+	instances := v.HeaderInstances
+	got := *v
+	got.HeaderInstances = nil
+	if !reflect.DeepEqual(testEd25519Verification, &got) {
+		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", testEd25519Verification, &got)
+	}
+	if len(instances) != 5 {
+		t.Fatalf("Expected five consumed header instances, got %v", instances)
+	}
+	for i, name := range []string{"From", "To", "Subject", "Date", "Message-ID"} {
+		if instances[i].Index != i+2 {
+			t.Errorf("Expected instance %v at index %v, got %v", name, i+2, instances[i].Index)
+		}
+		if instances[i].Name != name {
+			t.Errorf("Expected instance name %q, got %q", name, instances[i].Name)
+		}
+	}
+}
+
+func TestRemoveSignatureOnlyRemovesTheSignatureTag(t *testing.T) {
+	in := "DKIM-Signature: v=1; bh=Ab==; b=c2lnbmF0dXJl;\r\n"
+	want := "DKIM-Signature: v=1; bh=Ab==; b=;\r\n"
+	if got := removeSignature(in); got != want {
+		t.Errorf("Expected %q, got %q", want, got)
 	}
 }

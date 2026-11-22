@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -69,6 +68,11 @@ type Verification struct {
 
 	// The list of signed header fields.
 	HeaderKeys []string
+	// HeaderInstances lists the concrete header field occurrences consumed by
+	// this signature, in the same order as HeaderKeys. Entries in HeaderKeys
+	// which do not exist in the message do not consume an instance and are
+	// therefore absent from this list.
+	HeaderInstances []HeaderInstance
 	// The number of bytes in the body which are signed. If the whole body is
 	// signed, BodyLength is < 0.
 	BodyLength int64
@@ -87,10 +91,20 @@ type signature struct {
 	v string
 }
 
+// messageGeneration is the immutable message snapshot shared by all signatures
+// checked during one Verify call. Header selection, canonicalization and body
+// hashing operate on this snapshot instead of re-reading mutable input.
+type messageGeneration struct {
+	header header
+	body   []byte
+}
+
 // Verify checks if a message's signatures are valid. It returns one
 // verification per signature.
 //
-// There is no guarantee that the reader will be completely consumed.
+// The header and body are read once into an immutable message generation. Each
+// signature then gets its own reader over the same body bytes and its own
+// binding to concrete header field occurrences.
 func Verify(r io.Reader) ([]*Verification, error) {
 	// TODO: be able to specify options such as the max number of signatures to
 	// check
@@ -111,42 +125,68 @@ func Verify(r io.Reader) ([]*Verification, error) {
 		}
 	}
 
-	// Copy body in a buffer if multiple signatures are checked
-	var br *bytes.Reader
-	if len(signatures) > 1 {
-		b, err := ioutil.ReadAll(bufr)
-		if err != nil {
-			return nil, err
-		}
-		br = bytes.NewReader(b)
+	if len(signatures) == 0 {
+		return []*Verification{}, nil
+	}
+
+	// Snapshot the whole body once. Every signature is verified against this
+	// same generation, so a failed verification cannot consume bytes needed by
+	// a retry or by a later signature.
+	body, err := ioutil.ReadAll(bufr)
+	if err != nil {
+		return nil, err
+	}
+	gen := &messageGeneration{
+		header: append(header(nil), h...),
+		body:   body,
 	}
 
 	verifications := make([]*Verification, len(signatures))
+	var firstUnclassifiedErr error
 	for i, sig := range signatures {
-		// Use the bytes.Reader if there is one
-		var r io.Reader = bufr
-		if br != nil {
-			br.Seek(0, io.SeekStart)
-			r = br
-		}
-
-		v, err := verify(h, r, h[sig.i], sig.v)
+		v, err := verifyGeneration(gen, gen.header[sig.i], sig.v)
 		if err != nil && !IsTempFail(err) && !IsPermFail(err) && !isFail(err) {
-			return verifications, err
+			if firstUnclassifiedErr == nil {
+				firstUnclassifiedErr = err
+			}
 		}
 
 		v.Err = err
 		verifications[i] = v
 	}
-	return verifications, nil
+	return verifications, firstUnclassifiedErr
 }
 
 func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, error) {
+	body, err := ioutil.ReadAll(r)
+	if err != nil {
+		return &Verification{}, err
+	}
+	gen := &messageGeneration{
+		header: append(header(nil), h...),
+		body:   body,
+	}
+	return verifyGeneration(gen, sigField, sigValue)
+}
+
+func verifyGeneration(gen *messageGeneration, sigField, sigValue string) (*Verification, error) {
 	verif := new(Verification)
 
 	params, err := parseHeaderParams(sigValue)
 	if err != nil {
 		return verif, permFailError("malformed signature tags: " + err.Error())
+	}
+
+	var headerKeys []string
+	if h, ok := params["h"]; ok {
+		headerKeys = parseTagList(h)
+	}
+	verif.HeaderKeys = append([]string(nil), headerKeys...)
+	if headerKeys != nil {
+		// Bind h= to concrete physical header instances before any later
+		// verification stage can fail. A retry starts from this same report,
+		// never from a picker cursor left behind by a failed attempt.
+		verif.HeaderInstances = bindHeaderInstances(gen.header, headerKeys)
 	}
 
 	if params["v"] != "1" {
@@ -170,7 +210,6 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 		verif.Identifier = "@" + verif.Domain
 	}
 
-	headerKeys := parseTagList(params["h"])
 	ok := false
 	for _, k := range headerKeys {
 		if strings.ToLower(k) == "from" {
@@ -181,7 +220,6 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 	if !ok {
 		return verif, permFailError("From field not signed")
 	}
-	verif.HeaderKeys = headerKeys
 
 	if timeStr, ok := params["t"]; ok {
 		t, err := parseTime(timeStr)
@@ -308,7 +346,7 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 		w = &limitedWriter{W: w, N: bodyLen}
 	}
 	wc := canonicalizers[bodyCan].CanonicalizeBody(w)
-	if _, err := io.Copy(wc, r); err != nil {
+	if _, err := io.Copy(wc, bytes.NewReader(gen.body)); err != nil {
 		return verif, err
 	}
 	if err := wc.Close(); err != nil {
@@ -320,17 +358,8 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 
 	// Compute data hash
 	hasher.Reset()
-	picker := newHeaderPicker(h)
-	for _, key := range headerKeys {
-		kv := picker.Pick(key)
-		if kv == "" {
-			// The field MAY contain names of header fields that do not exist
-			// when signed; nonexistent header fields do not contribute to the
-			// signature computation
-			continue
-		}
-
-		kv = canonicalizers[headerCan].CanonicalizeHeader(kv)
+	for _, instance := range verif.HeaderInstances {
+		kv := canonicalizers[headerCan].CanonicalizeHeader(instance.Raw)
 		if _, err := hasher.Write([]byte(kv)); err != nil {
 			return verif, err
 		}
@@ -395,5 +424,47 @@ func stripWhitespace(s string) string {
 }
 
 func removeSignature(s string) string {
-	return regexp.MustCompile(`(b\s*=)[^;]+`).ReplaceAllString(s, "$1")
+	colon := strings.IndexByte(s, ':')
+	if colon < 0 {
+		return s
+	}
+
+	// Walk the tag list instead of using a regular expression: the base64
+	// values of other tags (in particular bh=) may themselves contain the
+	// byte sequence "b=" and must not be mistaken for the signature tag.
+	i := colon + 1
+	for i < len(s) {
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n' || s[i] == ';') {
+			i++
+		}
+		if i >= len(s) {
+			break
+		}
+
+		nameStart := i
+		for i < len(s) && s[i] != '=' && s[i] != ';' {
+			i++
+		}
+		name := strings.TrimSpace(s[nameStart:i])
+		if i >= len(s) || s[i] != '=' {
+			for i < len(s) && s[i] != ';' {
+				i++
+			}
+			continue
+		}
+
+		i++ // skip '='
+		valueStart := i
+		for i < len(s) && s[i] != ';' {
+			i++
+		}
+		if strings.EqualFold(name, "b") {
+			// Keep the b= tag itself but remove its value, including any
+			// folding whitespace inside it. Everything after the semicolon is
+			// preserved byte-for-byte.
+			return s[:valueStart] + s[i:]
+		}
+	}
+
+	return s
 }
