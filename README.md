@@ -46,6 +46,34 @@ for _, v := range verifications {
 }
 ```
 
+### Milter message transactions
+
+`cmd/dkim-milter` treats one SMTP message as one transaction. At the first
+header field it starts a new generation and captures the `Message-ID`; when the
+header block ends it freezes the header and body digest inputs. A signer,
+verification results and pending `Authentication-Results` edits belong only to
+that generation. A new message, `Abort`, `Reset` or a body-stage failure
+cancels the previous signer and verifier stream before the next message is
+accepted.
+
+The resulting `Authentication-Results` value keeps the existing DKIM result
+tokens (`pass`, `fail`, `permerror`, `temperror` or `none`) and appends
+transaction evidence as a comment:
+
+```
+mx.example.org; dkim=pass header.d=example.org
+ (dkim-milter generation=2 message-id=<id@example.org>
+  header-sha256=... body-sha256=... body-bytes=... stage=commit)
+```
+
+This makes the committed signature and report refer to the same message. A
+retry of an already committed `Message-ID` with the same header/body snapshot
+replays the original signature and report; different content under that
+identity is rejected rather than re-signed. Unsigned mail is still reported as
+`dkim=none`, recipients do not create separate transactions, and
+`Authentication-Results` fields written by other authserv-ids are left in
+place.
+
 ### FAQ
 
 **Why can't I verify a `mail.Message` directly?** A `mail.Message` header is
