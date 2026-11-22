@@ -46,6 +46,38 @@ for _, v := range verifications {
 }
 ```
 
+### DNS key cache and rotation
+
+`Verify` freezes the signature's domain, selector and public-key generation
+before it reads the body. The process-wide `KeyCache` is keyed by both domain
+and selector, so a key for one selector can never be reused for another. A
+rotation is committed only after the new DNS answer has been parsed
+completely; a temporary query failure leaves the previous committed generation
+intact and fails verification closed.
+
+Temporary DNS failures keep the last complete generation visible for
+diagnostics, but it is not used unless a caller explicitly enables stale
+fallback. A permanent answer such as a revoked or empty TXT record removes the
+old generation so it can never be resurrected.
+
+By default the cache re-checks DNS for every message (zero TTL). Callers that
+want to cache a confirmed key for a bounded time can pass their own cache and
+report options:
+
+```go
+cache := dkim.NewKeyCacheWithTTL(5 * time.Minute)
+
+verifications, err := dkim.VerifyWithOptions(r, &dkim.VerifyOptions{
+	KeyCache: cache,
+	Reports:  true,
+})
+```
+
+`VerifyReport` retains the frozen domain, selector, key generation, key
+fingerprint, cache source, message hashes and the stage at which verification
+failed. A cache snapshot can be persisted and restored with
+`KeyCache.Snapshot` and `NewKeyCacheFromSnapshot`.
+
 ### FAQ
 
 **Why can't I verify a `mail.Message` directly?** A `mail.Message` header is

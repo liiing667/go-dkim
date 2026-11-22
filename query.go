@@ -64,6 +64,9 @@ const (
 
 type queryFunc func(domain, selector string) (*queryResult, error)
 
+// queryMethods contains the authoritative lookup functions. Key and Query in
+// keycache.go wrap these functions in immutable selector generations; the
+// dns/txt implementation and its multi-TXT handling remain unchanged here.
 var queryMethods = map[QueryMethod]queryFunc{
 	QueryMethodDNSTXT: queryDNSTXT,
 }
