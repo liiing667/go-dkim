@@ -68,6 +68,16 @@ var queryMethods = map[QueryMethod]queryFunc{
 	QueryMethodDNSTXT: queryDNSTXT,
 }
 
+// ErrKeyRevoked is returned when the public key record explicitly has an
+// empty "p=" tag. RFC 6376 defines this as a permanent failure: the key has
+// been revoked and signatures made with it must no longer be trusted.
+var ErrKeyRevoked error = permFailError("key revoked")
+
+// IsKeyRevoked reports whether err is caused by a revoked DKIM public key.
+func IsKeyRevoked(err error) bool {
+	return err == ErrKeyRevoked
+}
+
 func queryDNSTXT(domain, selector string) (*queryResult, error) {
 	txts, err := net.LookupTXT(selector + "._domainkey." + domain)
 	if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
@@ -99,7 +109,7 @@ func parsePublicKey(s string) (*queryResult, error) {
 		return nil, permFailError("key syntax error: missing public key data")
 	}
 	if p == "" {
-		return nil, permFailError("key revoked")
+		return nil, ErrKeyRevoked
 	}
 	b, err := base64.StdEncoding.DecodeString(p)
 	if err != nil {

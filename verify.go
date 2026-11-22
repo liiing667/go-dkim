@@ -142,6 +142,21 @@ func Verify(r io.Reader) ([]*Verification, error) {
 }
 
 func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, error) {
+	return verifyWithTrace(h, r, sigField, sigValue, nil)
+}
+
+// verificationTrace records details which are not part of the historical
+// Verification API. It is optional so that Verify keeps returning exactly the
+// same values as before.
+type verificationTrace struct {
+	DNSStatus DNSStatus
+}
+
+func verifyWithTrace(h header, r io.Reader, sigField, sigValue string, trace *verificationTrace) (*Verification, error) {
+	if trace != nil {
+		trace.DNSStatus = DNSNotQueried
+	}
+
 	verif := new(Verification)
 
 	params, err := parseHeaderParams(sigValue)
@@ -215,9 +230,15 @@ func verify(h header, r io.Reader, sigField, sigValue string) (*Verification, er
 		}
 	}
 	if err != nil {
+		if trace != nil {
+			trace.DNSStatus = dnsStatusForError(err)
+		}
 		return verif, err
 	} else if res == nil {
 		return verif, permFailError("unsupported public key query method")
+	}
+	if trace != nil {
+		trace.DNSStatus = DNSOK
 	}
 
 	// Parse algos

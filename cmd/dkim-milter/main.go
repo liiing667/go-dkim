@@ -169,10 +169,10 @@ func (s *session) Headers(h textproto.MIMEHeader, m *milter.Modifier) (milter.Re
 	// Sign if necessary
 	if s.signDomain != "" {
 		opts := dkim.SignOptions{
-			Domain: s.signDomain,
-			Selector: selector,
-			Signer: privateKey,
-			HeaderKeys: s.signHeaderKeys,
+			Domain:       s.signDomain,
+			Selector:     selector,
+			Signer:       privateKey,
+			HeaderKeys:   s.signHeaderKeys,
 			QueryMethods: []dkim.QueryMethod{dkim.QueryMethodDNSTXT},
 		}
 
@@ -271,14 +271,17 @@ func (s *session) Body(m *milter.Modifier) (milter.Response, error) {
 			}
 		}
 
+		// Keep Authentication-Results on the same classification as the
+		// verification manifest consumers.
 		var val msgauth.ResultValue
-		if verif.Err == nil {
+		switch dkim.StatusForError(verif.Err) {
+		case dkim.StatusPass:
 			val = msgauth.ResultPass
-		} else if dkim.IsPermFail(verif.Err) {
+		case dkim.StatusPermError:
 			val = msgauth.ResultPermError
-		} else if dkim.IsTempFail(verif.Err) {
+		case dkim.StatusTempError:
 			val = msgauth.ResultTempError
-		} else {
+		default:
 			val = msgauth.ResultFail
 		}
 
